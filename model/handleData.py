@@ -8,24 +8,13 @@ import os
 
 
 class MedicalKGBuilder:
-    """医疗知识图谱构建器"""
-
     def __init__(self, neo4j_uri: str, neo4j_user: str, neo4j_password: str,
                  deepseek_api_key: str = None):
-        """
-        初始化
-        Args:
-            neo4j_uri: Neo4j数据库URI (例如: bolt://localhost:7687)
-            neo4j_user: Neo4j用户名
-            neo4j_password: Neo4j密码
-            deepseek_api_key: DeepSeek API密钥
-        """
         self.driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
         self.deepseek_api_key = deepseek_api_key or os.getenv('DEEPSEEK_API_KEY')
         self.deepseek_api_url = "https://api.deepseek.com/v1/chat/completions"
 
     def close(self):
-        """关闭数据库连接"""
         self.driver.close()
 
     def extract_knowledge_from_text(self, text: str, chunk_size: int = 3000) -> Dict[str, Any]:
@@ -96,29 +85,22 @@ class MedicalKGBuilder:
         Returns:
             包含entities和relationships的字典
         """
-        prompt = f"""请分析这份急危重伤病诊疗规范文档片段,提取关键实体和关系。
+        prompt = f"""分析以下医疗文档,提取实体和关系。
 
-实体类型:
-- Disease: 疾病/症状
-- Treatment: 治疗措施  
-- Examination: 检查项目
-- Medication: 药物
-- Department: 部门/科室
-- VitalSign: 生命体征指标
-- Complication: 并发症
+实体类型: Disease(疾病), Treatment(治疗), Examination(检查), Medication(药物), Department(科室), VitalSign(生命体征), Complication(并发症)
 
-关系类型:
-- REQUIRES_TREATMENT: 需要治疗
-- REQUIRES_EXAMINATION: 需要检查
-- USES_MEDICATION: 使用药物
-- BELONGS_TO_DEPARTMENT: 属于科室
-- MONITORS_SIGN: 监测指标
-- CAUSES_COMPLICATION: 引起并发症
+关系类型: REQUIRES_TREATMENT(需要治疗), REQUIRES_EXAMINATION(需要检查), USES_MEDICATION(使用药物), BELONGS_TO_DEPARTMENT(属于科室), MONITORS_SIGN(检测指标), CAUSES_COMPLICATION(引起并发症)
 
-输出JSON格式(使用简单的属性值):
+重要规则:
+1. 返回纯JSON,不要markdown标记
+2. 属性值用简单文本,避免特殊字符
+3. properties可以为空对象
+4. 确保JSON格式正确
+
+输出格式:
 {{
   "entities": [
-    {{"id": "d1", "type": "Disease", "name": "心脏骤停", "properties": {{"category": "循环系统"}}}},
+    {{"id": "d1", "type": "Disease", "name": "心脏骤停", "properties": {{}}}},
     {{"id": "t1", "type": "Treatment", "name": "心肺复苏", "properties": {{}}}}
   ],
   "relationships": [
@@ -126,12 +108,7 @@ class MedicalKGBuilder:
   ]
 }}
 
-注意:
-1. 只返回JSON,不要其他内容
-2. ID使用简单格式: d1,d2,t1,t2,e1,e2,m1,m2等
-3. properties可以为空对象{{}}
-
-文档片段:
+文档:
 {text}
 """
 
@@ -145,49 +122,85 @@ class MedicalKGBuilder:
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是医疗知识图谱构建专家。必须返回严格的JSON格式。"
+                    "content": "你是JSON数据提取专家。只返回有效的JSON,不要任何其他内容。"
                 },
                 {
                     "role": "user",
                     "content": prompt
                 }
             ],
-            "temperature": 0.1,
-            "max_tokens": 3000,
-            "response_format": {"type": "json_object"}
+            "temperature": 0,  # 设置为0以获得最确定的输出
+            "max_tokens": 4000
         }
 
-        response = requests.post(self.deepseek_api_url, headers=headers, json=payload, timeout=120)
-        response.raise_for_status()
-
-        response_data = response.json()
-        response_text = response_data['choices'][0]['message']['content']
-
-        # 清理响应
-        response_text = self._clean_json_response(response_text)
-
-        # 解析JSON
         try:
-            kg_data = json.loads(response_text)
+            response = requests.post(self.deepseek_api_url, headers=headers, json=payload, timeout=120)
+            response.raise_for_status()
+
+            response_data = response.json()
+            response_text = response_data['choices'][0]['message']['content']
+
+            # 调试信息
+            print(f"  原始响应长度: {len(response_text)} 字符")
+
+            # 多层清理和修复
+            response_text = self._clean_json_response(response_text)
+            response_text = self._extract_json_from_text(response_text)
+
+            # 尝试解析
+            try:
+                kg_data = json.loads(response_text)
+            except json.JSONDecodeError as e:
+                print(f"  第一次解析失败: {e}")
+
+                # 保存原始错误响应
+                error_file = f'error_batch_{batch_idx}_raw.txt'
+                with open(error_file, 'w', encoding='utf-8') as f:
+                    f.write(response_text)
+                print(f"  原始响应已保存: {error_file}")
+
+                # 尝试激进修复
+                print(f"  尝试修复JSON...")
+                response_text = self._fix_json_errors(response_text)
+
+                # 保存修复后的文本
+                fixed_file = f'error_batch_{batch_idx}_fixed.txt'
+                with open(fixed_file, 'w', encoding='utf-8') as f:
+                    f.write(response_text)
+                print(f"  修复后保存: {fixed_file}")
+
+                # 再次尝试解析
+                kg_data = json.loads(response_text)
+
+            # 验证并修复结构
+            if 'entities' not in kg_data:
+                print(f"  警告: 缺少entities字段,创建空列表")
+                kg_data['entities'] = []
+
+            if 'relationships' not in kg_data:
+                print(f"  警告: 缺少relationships字段,创建空列表")
+                kg_data['relationships'] = []
+
+            # 清理无效数据
+            kg_data['entities'] = [e for e in kg_data['entities']
+                                   if 'id' in e and 'type' in e and 'name' in e]
+            kg_data['relationships'] = [r for r in kg_data['relationships']
+                                        if 'from' in r and 'to' in r and 'type' in r]
+
+            return kg_data
+
         except json.JSONDecodeError as e:
-            print(f"  JSON解析失败: {e}")
-            # 保存错误响应
-            error_file = f'error_batch_{batch_idx}.txt'
-            with open(error_file, 'w', encoding='utf-8') as f:
-                f.write(response_text)
-            print(f"  错误响应已保存到: {error_file}")
+            print(f"  JSON解析失败(无法修复): {e}")
+            print(f"  错误位置: 第{e.lineno}行, 第{e.colno}列")
 
-            # 尝试修复
-            response_text = self._fix_json_errors(response_text)
-            kg_data = json.loads(response_text)
+            # 返回空结果而不是抛出异常
+            return {'entities': [], 'relationships': []}
 
-        # 验证结构
-        if 'entities' not in kg_data:
-            kg_data['entities'] = []
-        if 'relationships' not in kg_data:
-            kg_data['relationships'] = []
-
-        return kg_data
+        except Exception as e:
+            print(f"  处理失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'entities': [], 'relationships': []}
 
     def _reassign_ids(self, kg_data: Dict, id_counter: Dict) -> Dict:
         """
@@ -292,29 +305,87 @@ class MedicalKGBuilder:
 
     def _clean_json_response(self, text: str) -> str:
         """清理JSON响应"""
-        # 移除markdown代码块标记
-        text = re.sub(r'```json\s*', '', text)
-        text = re.sub(r'```\s*', '', text)
-        text = text.strip()
+        # 移除markdown代码块标记 (包括各种变体)
+        text = re.sub(r'```json\s*\n?', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'```\s*\n?', '', text)
 
         # 移除BOM
         if text.startswith('\ufeff'):
             text = text[1:]
 
+        # 去除首尾空白
+        text = text.strip()
+
+        # 如果文本以非JSON字符开始,尝试找到第一个{
+        if text and text[0] not in ('{', '['):
+            first_brace = text.find('{')
+            if first_brace != -1:
+                text = text[first_brace:]
+
+
+        # 如果文本以非JSON字符结束,尝试找到最后一个}
+        if text and text[-1] not in ('}', ']'):
+            last_brace = text.rfind('}')
+            if last_brace != -1:
+                text = text[:last_brace + 1]
+
         return text
 
     def _fix_json_errors(self, text: str) -> str:
         """尝试修复常见的JSON错误"""
-        # 修复单引号
+        import re
+
+        # 1. 移除控制字符
+        text = ''.join(char for char in text if ord(char) >= 32 or char in '\n\r\t')
+
+        # 2. 修复单引号
         text = text.replace("'", '"')
 
-        # 修复尾随逗号
+        # 3. 修复尾随逗号
         text = re.sub(r',\s*}', '}', text)
         text = re.sub(r',\s*]', ']', text)
 
-        # 修复未转义的引号
-        # 这个比较复杂,只做基本处理
+        # 4. 修复属性值中的未转义引号
+        # 查找 "key": "value with "quote"" 这种情况
+        def fix_quotes_in_values(match):
+            value = match.group(1)
+            # 转义内部的引号
+            fixed_value = value.replace('"', '\\"')
+            return f'": "{fixed_value}"'
 
+        # 5. 修复缺少逗号的情况
+        text = re.sub(r'}\s*{', '},{', text)
+        text = re.sub(r']\s*{', '],{', text)
+        text = re.sub(r'}\s*\[', '},[', text)
+
+        # 6. 修复属性名没有引号的情况
+        text = re.sub(r'(\w+)(\s*:\s*)', r'"\1"\2', text)
+
+        # 7. 移除注释
+        text = re.sub(r'//.*?\n', '\n', text)
+        text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
+
+        return text
+
+    def _extract_json_from_text(self, text: str) -> str:
+        """从文本中提取JSON部分"""
+        # 尝试找到最外层的大括号
+        stack = []
+        start_idx = -1
+
+        for i, char in enumerate(text):
+            if char == '{':
+                if not stack:
+                    start_idx = i
+                stack.append(char)
+            elif char == '}':
+                if stack:
+                    stack.pop()
+                    if not stack and start_idx != -1:
+                        # 找到完整的JSON对象
+                        return text[start_idx:i + 1]
+
+        # 如果没找到,返回原文本
         return text
 
     def _ensure_unique_ids(self, kg_data: Dict) -> Dict:
@@ -473,28 +544,141 @@ class MedicalKGBuilder:
         return stats
 
 
+def test_deepseek_connection(api_key: str):
+    """测试DeepSeek API连接和JSON输出"""
+    print("=" * 50)
+    print("测试DeepSeek API连接...")
+    print("=" * 50)
+
+    test_text = """
+    心脏骤停是指心脏突然停止跳动。需要立即进行心肺复苏。
+    主要治疗措施包括:
+    1. 胸外按压
+    2. 人工呼吸
+    3. 使用除颤器
+    需要监测心率和血压。
+    """
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是JSON专家。只返回JSON格式数据,不要markdown代码块。"
+            },
+            {
+                "role": "user",
+                "content": f"""提取以下文本的实体和关系,返回JSON:
+
+{{
+  "entities": [
+    {{"id": "d1", "type": "Disease", "name": "心脏骤停"}},
+    {{"id": "t1", "type": "Treatment", "name": "心肺复苏"}}
+  ],
+  "relationships": [
+    {{"from": "d1", "to": "t1", "type": "REQUIRES_TREATMENT"}}
+  ]
+}}
+
+文本: {test_text}"""
+            }
+        ],
+        "temperature": 0,
+        "max_tokens": 500
+    }
+
+    try:
+        response = requests.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        content = data['choices'][0]['message']['content']
+
+        print("\n原始响应:")
+        print(content)
+        print("\n" + "=" * 50)
+
+        # 清理markdown代码块
+        content_cleaned = re.sub(r'```json\s*', '', content)
+        content_cleaned = re.sub(r'```\s*', '', content_cleaned)
+        content_cleaned = content_cleaned.strip()
+
+        if content_cleaned != content:
+            print("\n清理后的JSON:")
+            print(content_cleaned)
+            print("\n" + "=" * 50)
+
+        # 尝试解析
+        try:
+            parsed = json.loads(content_cleaned)
+            print("✓ JSON解析成功!")
+            print(f"  实体数: {len(parsed.get('entities', []))}")
+            print(f"  关系数: {len(parsed.get('relationships', []))}")
+            return True
+        except json.JSONDecodeError as e:
+            print(f"✗ JSON解析失败: {e}")
+            print(f"  位置: 第{e.lineno}行, 第{e.colno}列")
+
+            # 显示出错位置附近的内容
+            lines = content_cleaned.split('\n')
+            if e.lineno <= len(lines):
+                print(f"  出错行内容: {lines[e.lineno - 1]}")
+
+            return False
+
+    except Exception as e:
+        print(f"✗ API调用失败: {e}")
+        return False
+
+
 def main():
     """主函数"""
-
-    # 读取文档
-    base_dir=os.path.dirname(os.path.abspath(__file__))
-    text_dir=os.path.join(base_dir,"words/需要紧急救治的急危重伤病标准.docx")
-    document_text=readDocx(text_dir)
 
     # Neo4j连接配置
     NEO4J_URI = "bolt://localhost:7687"
     NEO4J_USER = "neo4j"
     NEO4J_PASSWORD = "aqzdwsfneo"  # 请修改为你的密码
 
-    # DeepSeek API密钥 (或通过环境变量 DEEPSEEK_API_KEY 设置)
-    DEEPSEEK_API_KEY = "sk-8cbf10f456ae40aba1be330eaa3c2397"
+    # DeepSeek API密钥
+    DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY') or "sk-8cbf10f456ae40aba1be330eaa3c2397"
 
+    # 分批处理配置
+    CHUNK_SIZE = 1500  # 减小批次大小到2000字符
+
+    # 先测试API连接
+    print("步骤1: 测试DeepSeek API")
+    if not test_deepseek_connection(DEEPSEEK_API_KEY):
+        print("\n请检查:")
+        print("1. DEEPSEEK_API_KEY是否正确")
+        print("2. 网络连接是否正常")
+        print("3. API配额是否充足")
+        return
+
+    print("\n步骤2: 读取文档")
+    # 读取文档
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    text_dir = os.path.join(base_dir, "words/需要紧急救治的急危重伤病标准.docx")
+
+    # 读取.docx文件
+    document_text = readDocx(text_dir)
+
+    print("\n步骤3: 构建知识图谱")
     # 创建知识图谱构建器
     builder = MedicalKGBuilder(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, DEEPSEEK_API_KEY)
 
     try:
-        # 构建知识图谱
-        kg_data = builder.build_knowledge_graph(document_text)
+        # 构建知识图谱(分批处理)
+        kg_data = builder.build_knowledge_graph(document_text, chunk_size=CHUNK_SIZE)
 
         # 保存提取的数据到JSON文件
         with open('knowledge_graph.json', 'w', encoding='utf-8') as f:
@@ -508,19 +692,36 @@ def main():
             print(f"  {key}: {value}")
 
         # 示例查询
-        print("\n示例查询 - 查找所有疾病:")
+        print("\n示例查询 - 查找所有疾病(前10个):")
         diseases = builder.query_graph("MATCH (d:Disease) RETURN d.name as name LIMIT 10")
         for disease in diseases:
             print(f"  - {disease['name']}")
 
         print("\n示例查询 - 查找心脏骤停的治疗措施:")
         treatments = builder.query_graph("""
-            MATCH (d:Disease {name: '心脏骤停'})-[:REQUIRES_TREATMENT]->(t:Treatment)
+            MATCH (d:Disease)-[:REQUIRES_TREATMENT]->(t:Treatment)
+            WHERE d.name CONTAINS '心脏骤停'
             RETURN t.name as treatment
         """)
-        for treatment in treatments:
-            print(f"  - {treatment['treatment']}")
+        if treatments:
+            for treatment in treatments:
+                print(f"  - {treatment['treatment']}")
+        else:
+            print("  未找到相关数据")
 
+        print("\n示例查询 - 统计各类型实体数量:")
+        type_stats = builder.query_graph("""
+            MATCH (n)
+            RETURN labels(n)[0] as type, count(n) as count
+            ORDER BY count DESC
+        """)
+        for stat in type_stats:
+            print(f"  {stat['type']}: {stat['count']}")
+
+    except Exception as e:
+        print(f"\n发生错误: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         builder.close()
         print("\n数据库连接已关闭")
