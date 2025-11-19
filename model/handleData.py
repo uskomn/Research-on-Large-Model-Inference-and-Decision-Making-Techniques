@@ -8,42 +8,61 @@ import os
 
 
 class MedicalKGBuilder:
+    """医疗知识图谱构建器"""
+
     def __init__(self, neo4j_uri: str, neo4j_user: str, neo4j_password: str,
                  deepseek_api_key: str = None):
+        """
+        初始化
+        Args:
+            neo4j_uri: Neo4j数据库URI (例如: bolt://localhost:7687)
+            neo4j_user: Neo4j用户名
+            neo4j_password: Neo4j密码
+            deepseek_api_key: DeepSeek API密钥
+        """
         self.driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
         self.deepseek_api_key = deepseek_api_key or os.getenv('DEEPSEEK_API_KEY')
         self.deepseek_api_url = "https://api.deepseek.com/v1/chat/completions"
 
     def close(self):
+        """关闭数据库连接"""
         self.driver.close()
 
-    def extract_knowledge_from_text(self, text: str, chunk_size: int = 3000) -> Dict[str, Any]:
+    def extract_knowledge_from_text(self, text: str, chunk_size: int = 1500) -> Dict[str, Any]:
         """
-        使用DeepSeek提取文本中的知识图谱结构(分批处理)
+        使用DeepSeek提取文本中的知识图谱结构(分批处理+重叠)
         Args:
             text: 医疗文档文本
             chunk_size: 每批处理的文本长度
         Returns:
             包含entities和relationships的字典
         """
-        print("正在使用DeepSeek分析文档(分批处理)...")
+        print("正在使用DeepSeek分析文档(分批处理+重叠)...")
 
-        # 将文本分成多个块
+        # 使用重叠窗口分割文本,避免信息丢失
+        overlap = 300  # 重叠300字符
         text_chunks = []
-        for i in range(0, len(text), chunk_size):
-            chunk = text[i:i + chunk_size]
-            if chunk.strip():  # 跳过空块
+
+        i = 0
+        while i < len(text):
+            chunk_end = min(i + chunk_size, len(text))
+            chunk = text[i:chunk_end].strip()
+
+            if chunk:
                 text_chunks.append(chunk)
 
-        print(f"文档已分成 {len(text_chunks)} 批进行处理")
+            # 下一个块从当前块的后overlap位置开始
+            i += (chunk_size - overlap)
+
+        print(f"文档已分成 {len(text_chunks)} 批(每批重叠{overlap}字符)")
 
         all_entities = []
         all_relationships = []
-        entity_id_counter = {}  # 用于生成全局唯一ID
+        entity_id_counter = {}
 
         # 逐批处理
         for idx, chunk in enumerate(text_chunks):
-            print(f"\n处理第 {idx + 1}/{len(text_chunks)} 批...")
+            print(f"\n处理第 {idx + 1}/{len(text_chunks)} 批 (长度: {len(chunk)} 字符)...")
 
             try:
                 kg_chunk = self._extract_from_chunk(chunk, idx)
@@ -72,46 +91,142 @@ class MedicalKGBuilder:
         print(f"✓ 全部处理完成!")
         print(f"  总实体数: {len(final_kg['entities'])}")
         print(f"  总关系数: {len(final_kg['relationships'])}")
+        print(f"  重叠去重率: {len(all_entities) - len(final_kg['entities'])} 个重复实体已合并")
         print(f"{'=' * 50}\n")
 
         return final_kg
 
     def _extract_from_chunk(self, text: str, batch_idx: int) -> Dict[str, Any]:
         """
-        从单个文本块提取知识
+        从单个文本块提取知识(使用分步提取避免超长输出)
         Args:
             text: 文本块
             batch_idx: 批次索引
         Returns:
             包含entities和relationships的字典
         """
-        prompt = f"""分析以下医疗文档,提取实体和关系。
+        # 方案: 先提取实体,再提取关系(分两次调用)
+        print(f"  [1/2] 提取实体...")
+        entities = self._extract_entities_only(text)
 
-实体类型: Disease(疾病), Treatment(治疗), Examination(检查), Medication(药物), Department(科室), VitalSign(生命体征), Complication(并发症)
+        if not entities:
+            return {'entities': [], 'relationships': []}
 
-关系类型: REQUIRES_TREATMENT(需要治疗), REQUIRES_EXAMINATION(需要检查), USES_MEDICATION(使用药物), BELONGS_TO_DEPARTMENT(属于科室), MONITORS_SIGN(检测指标), CAUSES_COMPLICATION(引起并发症)
+        print(f"  [2/2] 提取关系...")
+        relationships = self._extract_relationships_only(text, entities)
 
-重要规则:
-1. 返回纯JSON,不要markdown标记
-2. 属性值用简单文本,避免特殊字符
-3. properties可以为空对象
-4. 确保JSON格式正确
+        return {
+            'entities': entities,
+            'relationships': relationships
+        }
 
-输出格式:
-{{
-  "entities": [
-    {{"id": "d1", "type": "Disease", "name": "心脏骤停", "properties": {{}}}},
-    {{"id": "t1", "type": "Treatment", "name": "心肺复苏", "properties": {{}}}}
-  ],
-  "relationships": [
-    {{"from": "d1", "to": "t1", "type": "REQUIRES_TREATMENT", "properties": {{}}}}
-  ]
-}}
+    def _extract_entities_only(self, text: str) -> List[Dict]:
+        """只提取实体(使用完整文本,不截断)"""
+        # 优化: 使用更多文本,但要求更严格的数量限制
+        text_sample = text[:1200] if len(text) > 1200 else text  # 用1200字符而不是800
 
-文档:
-{text}
+        prompt = f"""从医疗文档中提取关键实体。
+
+实体类型: Disease, Treatment, Examination, Medication, VitalSign, Complication
+
+严格规则:
+1. 每种类型最多5个,总共不超过25个
+2. 只提取最重要的核心实体
+3. 直接返回JSON数组,格式: [{{"id":"d1","type":"Disease","name":"心脏骤停"}},...]
+
+文档: {text_sample}
 """
 
+        try:
+            response = self._call_deepseek(prompt, max_tokens=1000)  # 增加到1000
+            response_text = self._clean_json_response(response)
+
+            # 提取JSON数组
+            if not response_text.startswith('['):
+                match = re.search(r'"entities"\s*:\s*(\[.*?\])', response_text, re.DOTALL)
+                if match:
+                    response_text = match.group(1)
+                else:
+                    match = re.search(r'(\[.*\])', response_text, re.DOTALL)
+                    if match:
+                        response_text = match.group(1)
+
+            entities = json.loads(response_text)
+
+            if isinstance(entities, dict) and 'entities' in entities:
+                entities = entities['entities']
+
+            # 添加properties字段
+            for e in entities:
+                if 'properties' not in e:
+                    e['properties'] = {}
+
+            print(f"      提取到 {len(entities)} 个实体")
+            return entities[:35]  # 增加到35个
+
+        except Exception as e:
+            print(f"      实体提取失败: {e}")
+            return []
+
+    def _extract_relationships_only(self, text: str, entities: List[Dict]) -> List[Dict]:
+        """只提取关系(使用更多文本)"""
+        # 使用前25个实体构建关系(增加覆盖范围)
+        entity_ids = [e['id'] for e in entities[:25]]
+        entity_list = ', '.join([f"{e['id']}({e['name']})" for e in entities[:25]])
+
+        # 使用更多文本
+        text_sample = text[:1000] if len(text) > 1000 else text  # 1000字符而不是600
+
+        prompt = f"""基于已提取的实体,找出它们之间的关系。
+
+实体列表: {entity_list}
+
+关系类型: REQUIRES_TREATMENT, REQUIRES_EXAMINATION, USES_MEDICATION, MONITORS_SIGN, CAUSES_COMPLICATION
+
+严格规则:
+1. 最多40个关系
+2. 只返回JSON数组,格式: [{{"from":"d1","to":"t1","type":"REQUIRES_TREATMENT"}},...]
+3. from和to必须在上述实体列表中
+
+文档: {text_sample}
+"""
+
+        try:
+            response = self._call_deepseek(prompt, max_tokens=1500)  # 增加到1500
+            response_text = self._clean_json_response(response)
+
+            # 提取JSON数组
+            if not response_text.startswith('['):
+                match = re.search(r'"relationships"\s*:\s*(\[.*?\])', response_text, re.DOTALL)
+                if match:
+                    response_text = match.group(1)
+                else:
+                    match = re.search(r'(\[.*\])', response_text, re.DOTALL)
+                    if match:
+                        response_text = match.group(1)
+
+            relationships = json.loads(response_text)
+
+            if isinstance(relationships, dict) and 'relationships' in relationships:
+                relationships = relationships['relationships']
+
+            # 添加properties并验证ID存在
+            valid_rels = []
+            for r in relationships:
+                if 'properties' not in r:
+                    r['properties'] = {}
+                if r.get('from') in entity_ids and r.get('to') in entity_ids:
+                    valid_rels.append(r)
+
+            print(f"      提取到 {len(valid_rels)} 个有效关系")
+            return valid_rels[:60]  # 增加到60个
+
+        except Exception as e:
+            print(f"      关系提取失败: {e}")
+            return []
+
+    def _call_deepseek(self, prompt: str, max_tokens: int = 1000) -> str:
+        """调用DeepSeek API"""
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.deepseek_api_key}"
@@ -122,85 +237,65 @@ class MedicalKGBuilder:
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是JSON数据提取专家。只返回有效的JSON,不要任何其他内容。"
+                    "content": "你是JSON数据提取专家。只返回JSON数组,不要其他内容。"
                 },
                 {
                     "role": "user",
                     "content": prompt
                 }
             ],
-            "temperature": 0,  # 设置为0以获得最确定的输出
-            "max_tokens": 4000
+            "temperature": 0,
+            "max_tokens": max_tokens
         }
 
-        try:
-            response = requests.post(self.deepseek_api_url, headers=headers, json=payload, timeout=120)
-            response.raise_for_status()
+        response = requests.post(self.deepseek_api_url, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
 
-            response_data = response.json()
-            response_text = response_data['choices'][0]['message']['content']
+        response_data = response.json()
+        return response_data['choices'][0]['message']['content']
 
-            # 调试信息
-            print(f"  原始响应长度: {len(response_text)} 字符")
+    def _fix_truncated_json(self, text: str) -> str:
+        """修复被截断的JSON"""
+        text = text.strip()
 
-            # 多层清理和修复
-            response_text = self._clean_json_response(response_text)
-            response_text = self._extract_json_from_text(response_text)
+        # 如果JSON不完整,尝试补全
+        open_braces = text.count('{')
+        close_braces = text.count('}')
+        open_brackets = text.count('[')
+        close_brackets = text.count(']')
 
-            # 尝试解析
+        # 补全缺失的括号
+        if open_braces > close_braces:
+            text += '}' * (open_braces - close_braces)
+
+        if open_brackets > close_brackets:
+            text += ']' * (open_brackets - close_brackets)
+
+        # 移除末尾不完整的行
+        lines = text.split('\n')
+
+        # 从后往前找到完整的结构
+        for i in range(len(lines) - 1, -1, -1):
+            test_text = '\n'.join(lines[:i + 1])
+
+            # 尝试补全并解析
+            test_open_braces = test_text.count('{')
+            test_close_braces = test_text.count('}')
+            test_open_brackets = test_text.count('[')
+            test_close_brackets = test_text.count(']')
+
+            if test_open_braces > test_close_braces:
+                test_text += '}' * (test_open_braces - test_close_braces)
+            if test_open_brackets > test_close_brackets:
+                test_text += ']' * (test_open_brackets - test_close_brackets)
+
             try:
-                kg_data = json.loads(response_text)
-            except json.JSONDecodeError as e:
-                print(f"  第一次解析失败: {e}")
+                json.loads(test_text)
+                return test_text
+            except:
+                continue
 
-                # 保存原始错误响应
-                error_file = f'error_batch_{batch_idx}_raw.txt'
-                with open(error_file, 'w', encoding='utf-8') as f:
-                    f.write(response_text)
-                print(f"  原始响应已保存: {error_file}")
-
-                # 尝试激进修复
-                print(f"  尝试修复JSON...")
-                response_text = self._fix_json_errors(response_text)
-
-                # 保存修复后的文本
-                fixed_file = f'error_batch_{batch_idx}_fixed.txt'
-                with open(fixed_file, 'w', encoding='utf-8') as f:
-                    f.write(response_text)
-                print(f"  修复后保存: {fixed_file}")
-
-                # 再次尝试解析
-                kg_data = json.loads(response_text)
-
-            # 验证并修复结构
-            if 'entities' not in kg_data:
-                print(f"  警告: 缺少entities字段,创建空列表")
-                kg_data['entities'] = []
-
-            if 'relationships' not in kg_data:
-                print(f"  警告: 缺少relationships字段,创建空列表")
-                kg_data['relationships'] = []
-
-            # 清理无效数据
-            kg_data['entities'] = [e for e in kg_data['entities']
-                                   if 'id' in e and 'type' in e and 'name' in e]
-            kg_data['relationships'] = [r for r in kg_data['relationships']
-                                        if 'from' in r and 'to' in r and 'type' in r]
-
-            return kg_data
-
-        except json.JSONDecodeError as e:
-            print(f"  JSON解析失败(无法修复): {e}")
-            print(f"  错误位置: 第{e.lineno}行, 第{e.colno}列")
-
-            # 返回空结果而不是抛出异常
-            return {'entities': [], 'relationships': []}
-
-        except Exception as e:
-            print(f"  处理失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return {'entities': [], 'relationships': []}
+        return text
 
     def _reassign_ids(self, kg_data: Dict, id_counter: Dict) -> Dict:
         """
@@ -321,7 +416,6 @@ class MedicalKGBuilder:
             first_brace = text.find('{')
             if first_brace != -1:
                 text = text[first_brace:]
-
 
         # 如果文本以非JSON字符结束,尝试找到最后一个}
         if text and text[-1] not in ('}', ']'):
