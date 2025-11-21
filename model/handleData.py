@@ -8,18 +8,8 @@ import os
 
 
 class MedicalKGBuilder:
-    """医疗知识图谱构建器"""
-
     def __init__(self, neo4j_uri: str, neo4j_user: str, neo4j_password: str,
                  deepseek_api_key: str = None):
-        """
-        初始化
-        Args:
-            neo4j_uri: Neo4j数据库URI (例如: bolt://localhost:7687)
-            neo4j_user: Neo4j用户名
-            neo4j_password: Neo4j密码
-            deepseek_api_key: DeepSeek API密钥
-        """
         self.driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
         self.deepseek_api_key = deepseek_api_key or os.getenv('DEEPSEEK_API_KEY')
         self.deepseek_api_url = "https://api.deepseek.com/v1/chat/completions"
@@ -121,24 +111,38 @@ class MedicalKGBuilder:
         }
 
     def _extract_entities_only(self, text: str) -> List[Dict]:
-        """只提取实体(使用完整文本,不截断)"""
-        # 优化: 使用更多文本,但要求更严格的数量限制
-        text_sample = text[:1200] if len(text) > 1200 else text  # 用1200字符而不是800
+        """只提取实体(包含属性)"""
+        text_sample = text[:1200] if len(text) > 1200 else text
 
-        prompt = f"""从医疗文档中提取关键实体。
+        prompt = f"""从医疗文档中提取关键实体及其属性。
 
-实体类型: Disease, Treatment, Examination, Medication, VitalSign, Complication
+实体类型与属性要求:
+- 疾病: 严重程度(危重/急症/一般)、所属系统(循环/呼吸/消化等)、症状描述
+- 治疗: 紧急程度(立即/尽快/常规)、操作类型(手术/物理/药物)、注意事项
+- 检查: 检查目的、正常范围、异常指标
+- 药物: 用药途径(静脉/口服/肌注)、剂量、使用时机
+- 生命体征: 正常范围、异常阈值、监测频率
+- 并发症: 发生率、危险因素、预防措施
 
 严格规则:
 1. 每种类型最多5个,总共不超过25个
-2. 只提取最重要的核心实体
-3. 直接返回JSON数组,格式: [{{"id":"d1","type":"Disease","name":"心脏骤停"}},...]
+2. properties必须包含至少1个有意义的属性
+3. 如果文档中没有属性信息,properties可为空对象
+4. 直接返回JSON数组
+
+格式示例:
+[
+  {{"id":"d1","type":"疾病","name":"心脏骤停","properties":{{"严重程度":"危重","所属系统":"循环系统"}}}},
+  {{"id":"t1","type":"治疗","name":"心肺复苏","properties":{{"紧急程度":"立即","操作类型":"手法"}}}},
+  {{"id":"m1","type":"药物","name":"肾上腺素","properties":{{"用药途径":"静脉注射","剂量":"1mg"}}}},
+  {{"id":"v1","type":"生命体征","name":"心率","properties":{{"正常范围":"60-100次/分","异常阈值":"<50或>130次/分"}}}}
+]
 
 文档: {text_sample}
 """
 
         try:
-            response = self._call_deepseek(prompt, max_tokens=1000)  # 增加到1000
+            response = self._call_deepseek(prompt, max_tokens=1200)
             response_text = self._clean_json_response(response)
 
             # 提取JSON数组
@@ -156,43 +160,60 @@ class MedicalKGBuilder:
             if isinstance(entities, dict) and 'entities' in entities:
                 entities = entities['entities']
 
-            # 添加properties字段
+            # 确保properties字段存在
             for e in entities:
                 if 'properties' not in e:
                     e['properties'] = {}
 
             print(f"      提取到 {len(entities)} 个实体")
-            return entities[:35]  # 增加到35个
+
+            # 统计有属性的实体数量
+            with_props = sum(1 for e in entities if e.get('properties'))
+            if with_props > 0:
+                print(f"      其中 {with_props} 个包含属性信息")
+
+            return entities[:35]
 
         except Exception as e:
             print(f"      实体提取失败: {e}")
             return []
 
     def _extract_relationships_only(self, text: str, entities: List[Dict]) -> List[Dict]:
-        """只提取关系(使用更多文本)"""
-        # 使用前25个实体构建关系(增加覆盖范围)
+        """只提取关系(包含关系属性)"""
         entity_ids = [e['id'] for e in entities[:25]]
         entity_list = ', '.join([f"{e['id']}({e['name']})" for e in entities[:25]])
 
-        # 使用更多文本
-        text_sample = text[:1000] if len(text) > 1000 else text  # 1000字符而不是600
+        text_sample = text[:1000] if len(text) > 1000 else text
 
-        prompt = f"""基于已提取的实体,找出它们之间的关系。
+        prompt = f"""基于已提取的实体,找出它们之间的关系及关系属性。
 
 实体列表: {entity_list}
 
-关系类型: REQUIRES_TREATMENT, REQUIRES_EXAMINATION, USES_MEDICATION, MONITORS_SIGN, CAUSES_COMPLICATION
+关系类型与属性:
+- 需要治疗: 时机(立即/尽快/必要时)、顺序(首选/备选)、条件(如症状严重时)
+- 需要检查: 频率(持续/定期/必要时)、目的(确诊/监测/评估)
+- 使用药物: 剂量、给药方式、使用时机、注意事项
+- 监测指标: 监测频率(持续/每小时/定期)、目标值
+- 引起并发症: 发生率(常见/少见)、条件(如未及时治疗)
 
 严格规则:
 1. 最多40个关系
-2. 只返回JSON数组,格式: [{{"from":"d1","to":"t1","type":"REQUIRES_TREATMENT"}},...]
-3. from和to必须在上述实体列表中
+2. properties可包含关系的详细信息,也可为空
+3. from和to必须在实体列表中
+4. 直接返回JSON数组
+
+格式示例:
+[
+  {{"from":"d1","to":"t1","type":"需要治疗","properties":{{"时机":"立即","优先级":"最高"}}}},
+  {{"from":"d1","to":"m1","type":"使用药物","properties":{{"剂量":"1mg","途径":"静脉"}}}},
+  {{"from":"d2","to":"v1","type":"监测指标","properties":{{"频率":"持续监测"}}}}
+]
 
 文档: {text_sample}
 """
 
         try:
-            response = self._call_deepseek(prompt, max_tokens=1500)  # 增加到1500
+            response = self._call_deepseek(prompt, max_tokens=1800)
             response_text = self._clean_json_response(response)
 
             # 提取JSON数组
@@ -210,7 +231,7 @@ class MedicalKGBuilder:
             if isinstance(relationships, dict) and 'relationships' in relationships:
                 relationships = relationships['relationships']
 
-            # 添加properties并验证ID存在
+            # 确保properties并验证ID存在
             valid_rels = []
             for r in relationships:
                 if 'properties' not in r:
@@ -219,7 +240,13 @@ class MedicalKGBuilder:
                     valid_rels.append(r)
 
             print(f"      提取到 {len(valid_rels)} 个有效关系")
-            return valid_rels[:60]  # 增加到60个
+
+            # 统计有属性的关系数量
+            with_props = sum(1 for r in valid_rels if r.get('properties'))
+            if with_props > 0:
+                print(f"      其中 {with_props} 个包含属性信息")
+
+            return valid_rels[:60]
 
         except Exception as e:
             print(f"      关系提取失败: {e}")
@@ -312,13 +339,19 @@ class MedicalKGBuilder:
             entity_type = entity['type']
             old_id = entity['id']
 
-            # 根据类型生成前缀
+            # 根据类型生成前缀(支持中文类型)
             prefix_map = {
+                '疾病': 'd',
+                '治疗': 't',
+                '检查': 'e',
+                '药物': 'm',
+                '生命体征': 'v',
+                '并发症': 'c',
+                # 兼容英文
                 'Disease': 'd',
                 'Treatment': 't',
                 'Examination': 'e',
                 'Medication': 'm',
-                'Department': 'dept',
                 'VitalSign': 'v',
                 'Complication': 'c'
             }
@@ -425,79 +458,21 @@ class MedicalKGBuilder:
 
         return text
 
-    def _fix_json_errors(self, text: str) -> str:
-        """尝试修复常见的JSON错误"""
-        import re
-
-        # 1. 移除控制字符
-        text = ''.join(char for char in text if ord(char) >= 32 or char in '\n\r\t')
-
-        # 2. 修复单引号
-        text = text.replace("'", '"')
-
-        # 3. 修复尾随逗号
-        text = re.sub(r',\s*}', '}', text)
-        text = re.sub(r',\s*]', ']', text)
-
-        # 4. 修复属性值中的未转义引号
-        # 查找 "key": "value with "quote"" 这种情况
-        def fix_quotes_in_values(match):
-            value = match.group(1)
-            # 转义内部的引号
-            fixed_value = value.replace('"', '\\"')
-            return f'": "{fixed_value}"'
-
-        # 5. 修复缺少逗号的情况
-        text = re.sub(r'}\s*{', '},{', text)
-        text = re.sub(r']\s*{', '],{', text)
-        text = re.sub(r'}\s*\[', '},[', text)
-
-        # 6. 修复属性名没有引号的情况
-        text = re.sub(r'(\w+)(\s*:\s*)', r'"\1"\2', text)
-
-        # 7. 移除注释
-        text = re.sub(r'//.*?\n', '\n', text)
-        text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
-
-        return text
-
-    def _extract_json_from_text(self, text: str) -> str:
-        """从文本中提取JSON部分"""
-        # 尝试找到最外层的大括号
-        stack = []
-        start_idx = -1
-
-        for i, char in enumerate(text):
-            if char == '{':
-                if not stack:
-                    start_idx = i
-                stack.append(char)
-            elif char == '}':
-                if stack:
-                    stack.pop()
-                    if not stack and start_idx != -1:
-                        # 找到完整的JSON对象
-                        return text[start_idx:i + 1]
-
-        # 如果没找到,返回原文本
-        return text
-
     def _ensure_unique_ids(self, kg_data: Dict) -> Dict:
         """确保实体ID唯一(保留用于向后兼容)"""
         return kg_data
 
     def create_constraints(self):
-        """创建Neo4j约束和索引"""
+        """创建Neo4j约束和索引(使用中文标签)"""
         print("创建数据库约束和索引...")
 
         constraints = [
-            "CREATE CONSTRAINT IF NOT EXISTS FOR (d:Disease) REQUIRE d.id IS UNIQUE",
-            "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Treatment) REQUIRE t.id IS UNIQUE",
-            "CREATE CONSTRAINT IF NOT EXISTS FOR (e:Examination) REQUIRE e.id IS UNIQUE",
-            "CREATE CONSTRAINT IF NOT EXISTS FOR (m:Medication) REQUIRE m.id IS UNIQUE",
-            "CREATE CONSTRAINT IF NOT EXISTS FOR (d:Department) REQUIRE d.id IS UNIQUE",
-            "CREATE CONSTRAINT IF NOT EXISTS FOR (v:VitalSign) REQUIRE v.id IS UNIQUE",
-            "CREATE CONSTRAINT IF NOT EXISTS FOR (c:Complication) REQUIRE c.id IS UNIQUE"
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (d:疾病) REQUIRE d.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (t:治疗) REQUIRE t.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (e:检查) REQUIRE e.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (m:药物) REQUIRE m.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (v:生命体征) REQUIRE v.id IS UNIQUE",
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (c:并发症) REQUIRE c.id IS UNIQUE"
         ]
 
         with self.driver.session() as session:
@@ -508,7 +483,7 @@ class MedicalKGBuilder:
                     print(f"约束创建警告: {e}")
 
     def create_entities(self, entities: List[Dict]):
-        """创建实体节点"""
+        """创建实体节点(包含所有属性)"""
         print(f"创建{len(entities)}个实体节点...")
 
         with self.driver.session() as session:
@@ -518,28 +493,48 @@ class MedicalKGBuilder:
                 entity_name = entity['name']
                 properties = entity.get('properties', {})
 
-                # 构建属性字符串
-                props_str = ', '.join([f"{k}: ${k}" for k in properties.keys()])
-                if props_str:
-                    props_str = ', ' + props_str
-
-                cypher = f"""
-                MERGE (n:{entity_type} {{id: $id}})
-                SET n.name = $name{props_str}
-                """
-
+                # 构建属性设置语句 (正确的Cypher语法)
+                # SET n.prop1 = $prop1, n.prop2 = $prop2
+                prop_assignments = []
                 params = {
                     'id': entity_id,
-                    'name': entity_name,
-                    **properties
+                    'name': entity_name
                 }
 
-                session.run(cypher, params)
+                # 添加所有properties到参数中
+                for key, value in properties.items():
+                    # 清理属性名(移除特殊字符,避免语法错误)
+                    safe_key = key.replace(' ', '_').replace('-', '_').replace('/', '_')
+                    prop_assignments.append(f"n.`{safe_key}` = ${safe_key}")
+                    params[safe_key] = value
+
+                # 构建SET子句
+                if prop_assignments:
+                    set_clause = f"SET n.name = $name, {', '.join(prop_assignments)}"
+                else:
+                    set_clause = "SET n.name = $name"
+
+                # 使用反引号包裹标签,支持中文
+                cypher = f"""
+                MERGE (n:`{entity_type}` {{id: $id}})
+                {set_clause}
+                """
+
+                try:
+                    session.run(cypher, params)
+                except Exception as e:
+                    print(f"  警告: 创建实体 {entity_name} 时出错: {e}")
+                    # 如果失败,尝试只创建基本信息
+                    cypher_fallback = f"""
+                    MERGE (n:`{entity_type}` {{id: $id}})
+                    SET n.name = $name
+                    """
+                    session.run(cypher_fallback, {'id': entity_id, 'name': entity_name})
 
         print("实体创建完成")
 
     def create_relationships(self, relationships: List[Dict]):
-        """创建关系"""
+        """创建关系(包含所有属性)"""
         print(f"创建{len(relationships)}个关系...")
 
         with self.driver.session() as session:
@@ -549,27 +544,37 @@ class MedicalKGBuilder:
                 rel_type = rel['type']
                 properties = rel.get('properties', {})
 
-                # 构建属性字符串
-                if properties:
-                    props_str = '{' + ', '.join([f"{k}: ${k}" for k in properties.keys()]) + '}'
-                else:
-                    props_str = ''
-
-                cypher = f"""
-                MATCH (a {{id: $from_id}}), (b {{id: $to_id}})
-                MERGE (a)-[r:{rel_type} {props_str}]->(b)
-                """
-
+                # 构建关系属性
                 params = {
                     'from_id': from_id,
-                    'to_id': to_id,
-                    **properties
+                    'to_id': to_id
                 }
+
+                # 添加所有properties到参数中
+                prop_assignments = []
+                for key, value in properties.items():
+                    # 清理属性名
+                    safe_key = key.replace(' ', '_').replace('-', '_').replace('/', '_')
+                    prop_assignments.append(f"r.`{safe_key}` = ${safe_key}")
+                    params[safe_key] = value
+
+                # 构建SET子句
+                if prop_assignments:
+                    set_clause = f"SET {', '.join(prop_assignments)}"
+                else:
+                    set_clause = ""
+
+                # 使用反引号包裹关系类型,支持中文
+                cypher = f"""
+                MATCH (a {{id: $from_id}}), (b {{id: $to_id}})
+                MERGE (a)-[r:`{rel_type}`]->(b)
+                {set_clause}
+                """
 
                 try:
                     session.run(cypher, params)
                 except Exception as e:
-                    print(f"关系创建警告: {from_id} -> {to_id}: {e}")
+                    print(f"  警告: 创建关系 {from_id} -> {to_id} 时出错: {e}")
 
         print("关系创建完成")
 
@@ -615,202 +620,60 @@ class MedicalKGBuilder:
             return [record.data() for record in result]
 
     def get_statistics(self) -> Dict:
-        """获取图谱统计信息"""
+        """获取图谱统计信息(支持中文标签)"""
         stats = {}
 
         with self.driver.session() as session:
-            # 统计各类型节点数量
-            node_types = ['Disease', 'Treatment', 'Examination', 'Medication',
-                          'Department', 'VitalSign', 'Complication']
+            # 统计各类型节点数量(支持中英文)
+            node_types = ['疾病', '治疗', '检查', '药物', '生命体征', '并发症']
 
             for node_type in node_types:
-                result = session.run(f"MATCH (n:{node_type}) RETURN count(n) as count")
-                stats[node_type] = result.single()['count']
+                try:
+                    result = session.run(f"MATCH (n:`{node_type}`) RETURN count(n) as count")
+                    count = result.single()
+                    if count:
+                        stats[node_type] = count['count']
+                except:
+                    stats[node_type] = 0
 
             # 统计关系数量
             result = session.run("MATCH ()-[r]->() RETURN count(r) as count")
-            stats['total_relationships'] = result.single()['count']
+            stats['总关系数'] = result.single()['count']
 
             # 统计总节点数
             result = session.run("MATCH (n) RETURN count(n) as count")
-            stats['total_nodes'] = result.single()['count']
+            stats['总节点数'] = result.single()['count']
 
         return stats
 
-
-def test_deepseek_connection(api_key: str):
-    """测试DeepSeek API连接和JSON输出"""
-    print("=" * 50)
-    print("测试DeepSeek API连接...")
-    print("=" * 50)
-
-    test_text = """
-    心脏骤停是指心脏突然停止跳动。需要立即进行心肺复苏。
-    主要治疗措施包括:
-    1. 胸外按压
-    2. 人工呼吸
-    3. 使用除颤器
-    需要监测心率和血压。
-    """
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}"
-    }
-
-    payload = {
-        "model": "deepseek-chat",
-        "messages": [
-            {
-                "role": "system",
-                "content": "你是JSON专家。只返回JSON格式数据,不要markdown代码块。"
-            },
-            {
-                "role": "user",
-                "content": f"""提取以下文本的实体和关系,返回JSON:
-
-{{
-  "entities": [
-    {{"id": "d1", "type": "Disease", "name": "心脏骤停"}},
-    {{"id": "t1", "type": "Treatment", "name": "心肺复苏"}}
-  ],
-  "relationships": [
-    {{"from": "d1", "to": "t1", "type": "REQUIRES_TREATMENT"}}
-  ]
-}}
-
-文本: {test_text}"""
-            }
-        ],
-        "temperature": 0,
-        "max_tokens": 500
-    }
-
-    try:
-        response = requests.post(
-            "https://api.deepseek.com/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
-        response.raise_for_status()
-
-        data = response.json()
-        content = data['choices'][0]['message']['content']
-
-        print("\n原始响应:")
-        print(content)
-        print("\n" + "=" * 50)
-
-        # 清理markdown代码块
-        content_cleaned = re.sub(r'```json\s*', '', content)
-        content_cleaned = re.sub(r'```\s*', '', content_cleaned)
-        content_cleaned = content_cleaned.strip()
-
-        if content_cleaned != content:
-            print("\n清理后的JSON:")
-            print(content_cleaned)
-            print("\n" + "=" * 50)
-
-        # 尝试解析
-        try:
-            parsed = json.loads(content_cleaned)
-            print("✓ JSON解析成功!")
-            print(f"  实体数: {len(parsed.get('entities', []))}")
-            print(f"  关系数: {len(parsed.get('relationships', []))}")
-            return True
-        except json.JSONDecodeError as e:
-            print(f"✗ JSON解析失败: {e}")
-            print(f"  位置: 第{e.lineno}行, 第{e.colno}列")
-
-            # 显示出错位置附近的内容
-            lines = content_cleaned.split('\n')
-            if e.lineno <= len(lines):
-                print(f"  出错行内容: {lines[e.lineno - 1]}")
-
-            return False
-
-    except Exception as e:
-        print(f"✗ API调用失败: {e}")
-        return False
-
-
 def main():
-    """主函数"""
-
-    # Neo4j连接配置
     NEO4J_URI = "bolt://localhost:7687"
     NEO4J_USER = "neo4j"
     NEO4J_PASSWORD = "aqzdwsfneo"  # 请修改为你的密码
 
-    # DeepSeek API密钥
     DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY') or "sk-8cbf10f456ae40aba1be330eaa3c2397"
 
-    # 分批处理配置
-    CHUNK_SIZE = 1500  # 减小批次大小到2000字符
+    CHUNK_SIZE = 1500
 
-    # 先测试API连接
-    print("步骤1: 测试DeepSeek API")
-    if not test_deepseek_connection(DEEPSEEK_API_KEY):
-        print("\n请检查:")
-        print("1. DEEPSEEK_API_KEY是否正确")
-        print("2. 网络连接是否正常")
-        print("3. API配额是否充足")
-        return
-
-    print("\n步骤2: 读取文档")
-    # 读取文档
     base_dir = os.path.dirname(os.path.abspath(__file__))
     text_dir = os.path.join(base_dir, "words/需要紧急救治的急危重伤病标准.docx")
 
-    # 读取.docx文件
     document_text = readDocx(text_dir)
 
-    print("\n步骤3: 构建知识图谱")
-    # 创建知识图谱构建器
     builder = MedicalKGBuilder(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, DEEPSEEK_API_KEY)
 
     try:
-        # 构建知识图谱(分批处理)
         kg_data = builder.build_knowledge_graph(document_text, chunk_size=CHUNK_SIZE)
 
-        # 保存提取的数据到JSON文件
         with open('knowledge_graph.json', 'w', encoding='utf-8') as f:
             json.dump(kg_data, f, ensure_ascii=False, indent=2)
         print("\n知识图谱数据已保存到 knowledge_graph.json")
 
-        # 获取统计信息
         print("\n图谱统计信息:")
         stats = builder.get_statistics()
         for key, value in stats.items():
             print(f"  {key}: {value}")
 
-        # 示例查询
-        print("\n示例查询 - 查找所有疾病(前10个):")
-        diseases = builder.query_graph("MATCH (d:Disease) RETURN d.name as name LIMIT 10")
-        for disease in diseases:
-            print(f"  - {disease['name']}")
-
-        print("\n示例查询 - 查找心脏骤停的治疗措施:")
-        treatments = builder.query_graph("""
-            MATCH (d:Disease)-[:REQUIRES_TREATMENT]->(t:Treatment)
-            WHERE d.name CONTAINS '心脏骤停'
-            RETURN t.name as treatment
-        """)
-        if treatments:
-            for treatment in treatments:
-                print(f"  - {treatment['treatment']}")
-        else:
-            print("  未找到相关数据")
-
-        print("\n示例查询 - 统计各类型实体数量:")
-        type_stats = builder.query_graph("""
-            MATCH (n)
-            RETURN labels(n)[0] as type, count(n) as count
-            ORDER BY count DESC
-        """)
-        for stat in type_stats:
-            print(f"  {stat['type']}: {stat['count']}")
 
     except Exception as e:
         print(f"\n发生错误: {e}")
