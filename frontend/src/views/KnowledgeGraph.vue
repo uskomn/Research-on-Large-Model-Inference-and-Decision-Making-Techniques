@@ -22,21 +22,42 @@
             {{ showLabels ? '隐藏标签' : '显示标签' }}
           </el-button>
         </el-col>
-        <el-col :span="8">
+        <el-col :span="6">
           <el-select v-model="selectedNodeType" placeholder="筛选节点类型" clearable>
             <el-option label="全部" value="" />
-            <el-option label="系统" value="system" />
             <el-option label="疾病" value="disease" />
-            <el-option label="症状" value="symptom" />
-            <el-option label="处置" value="treatment" />
-            <el-option label="原因" value="cause" />
+            <el-option label="治疗" value="treatment" />
+            <el-option label="检查" value="examination" />
+            <el-option label="药物" value="medication" />
+            <el-option label="生命体征" value="vital_signs" />
+            <el-option label="并发症" value="complication" />
           </el-select>
         </el-col>
-        <el-col :span="8">
+        <el-col :span="6">
+          <div class="graph-info">
+            <el-tag :type="databaseStatusType" size="small">
+              {{ databaseStatus }}
+            </el-tag>
+          </div>
+        </el-col>
+        <el-col :span="6">
           <div class="graph-info">
             <el-tag type="info" size="small">
               节点: {{ filteredNodes.length }} | 连接: {{ filteredLinks.length }}
             </el-tag>
+          </div>
+        </el-col>
+        <el-col :span="6">
+          <div class="graph-actions">
+            <el-button 
+              size="small" 
+              @click="refreshData" 
+              :loading="isRefreshing"
+              plain
+            >
+              <el-icon><Refresh /></el-icon>
+              刷新数据
+            </el-button>
           </div>
         </el-col>
       </el-row>
@@ -54,24 +75,41 @@
     <!-- 节点详情面板 -->
     <el-drawer
       v-model="showDetails"
-      title="节点详情"
+      :title="selectedNode ? '节点详情 - ' + selectedNode.label : '节点详情'"
       direction="rtl"
-      size="30%"
+      size="35%"
     >
-      <div v-if="selectedNode">
-        <h4>{{ selectedNode.label }}</h4>
-        <el-tag :type="getNodeTypeColor(selectedNode.group)" size="small">
-          {{ getNodeTypeText(selectedNode.group) }}
-        </el-tag>
-        
-        <div class="node-connections">
-          <h5>相关连接:</h5>
-          <ul>
-            <li v-for="link in getNodeConnections(selectedNode.id)" :key="link.target || link.source">
-              {{ getNodeName(link.target || link.source) }}
-            </li>
-          </ul>
+      <div v-if="selectedNode" class="neo4j-details-panel">
+        <!-- 节点基本信息 -->
+        <div class="node-header">
+          <div class="node-icon" :style="{ backgroundColor: nodeColors[selectedNode.group] || '#999' }">
+            {{ getNodeTypeIcon(selectedNode.group) }}
+          </div>
+          <div class="node-basic-info">
+            <h3>{{ selectedNode.label }}</h3>
+            <el-tag :type="getNodeTypeColor(selectedNode.group)" size="default">
+              {{ selectedNode.type }}
+            </el-tag>
+            <el-tag v-if="selectedNode.group === 'disease'" type="danger" size="small">
+              ID: {{ selectedNode.id }}
+            </el-tag>
+          </div>
         </div>
+        
+        <!-- 节点属性信息 -->
+        <div class="node-properties" v-if="selectedNode.properties">
+          <h5>
+            <el-icon><Document /></el-icon>
+            属性信息
+          </h5>
+          <div class="properties-grid">
+            <div class="property-card" v-for="(value, key) in selectedNode.properties" :key="key" v-if="value">
+              <div class="property-key">{{ formatPropertyKey(key) }}</div>
+              <div class="property-value">{{ value }}</div>
+            </div>
+          </div>
+        </div>
+
       </div>
     </el-drawer>
 
@@ -104,20 +142,26 @@ export default {
     const showDetails = ref(false)
     const selectedNode = ref(null)
     const selectedNodeType = ref('')
+    const isRefreshing = ref(false)
     
     const svgWidth = ref(800)
     const svgHeight = ref(600)
     
+    // 数据库状态
+    const databaseStatus = ref('检查中...')
+    const databaseStatusType = ref('info')
+    
     const graphData = ref({ nodes: [], links: [] })
     
-    // 节点颜色映射
+    // 节点颜色映射，适配新的实体类型
     const nodeColors = {
-      root: '#ff6b6b',
-      system: '#4ecdc4',
-      disease: '#45b7d1',
-      symptom: '#96ceb4',
-      treatment: '#ffeaa7',
-      cause: '#dda0dd'
+      disease: '#e74c3c',      // 疾病 - 红色
+      treatment: '#3498db',    // 治疗 - 蓝色
+      examination: '#f39c12',  // 检查 - 橙色
+      medication: '#9b59b6',   // 药物 - 紫色
+      vital_signs: '#1abc9c',  // 生命体征 - 青色
+      complication: '#e67e22', // 并发症 - 深橙色
+      other: '#95a5a6'         // 其他 - 灰色
     }
 
     // 计算过滤后的节点和连接
@@ -127,16 +171,44 @@ export default {
     })
 
     const filteredLinks = computed(() => {
+      // 如果没有筛选，返回所有连线
+      if (!selectedNodeType.value) {
+        return graphData.value.links
+      }
+      
+      // 如果有筛选，只显示与选中节点类型相关的连线
       const nodeIds = new Set(filteredNodes.value.map(node => node.id))
-      return graphData.value.links.filter(link => 
-        nodeIds.has(link.source) && nodeIds.has(link.target)
-      )
+      return graphData.value.links.filter(link => {
+        const sourceId = typeof link.source === 'object' ? link.source.id : link.source
+        const targetId = typeof link.target === 'object' ? link.target.id : link.target
+        return nodeIds.has(sourceId) || nodeIds.has(targetId)
+      })
     })
+
+    // 检查数据库状态
+    const checkDatabaseStatus = async () => {
+      try {
+        const healthResponse = await fetch('http://localhost:5000/knowledge_graph/test_connection')
+        const healthData = await healthResponse.json()
+        if (healthData.database && healthData.message.includes('正常')) {
+          databaseStatus.value = 'Neo4j数据库状态正常'
+          databaseStatusType.value = 'success'
+        } else {
+          databaseStatus.value = 'Neo4j数据库状态正常'
+          databaseStatusType.value = 'warning'
+        }
+      } catch (error) {
+        databaseStatus.value = '数据库连接失败'
+        databaseStatusType.value = 'danger'
+      }
+    }
 
     // 初始化图谱
     const initGraph = async () => {
       try {
         isLoading.value = true
+        await checkDatabaseStatus()
+        
         const response = await knowledgeApi.getKnowledgeGraph()
         graphData.value = response
         
@@ -150,14 +222,36 @@ export default {
       }
     }
 
+    // 刷新数据
+    const refreshData = async () => {
+      isRefreshing.value = true
+      try {
+        await checkDatabaseStatus()
+        await initGraph()
+        ElMessage.success('数据刷新成功')
+      } catch (error) {
+        console.error('刷新数据失败:', error)
+        ElMessage.error('刷新数据失败')
+      } finally {
+        isRefreshing.value = false
+      }
+    }
+
     // 渲染图谱
     const renderGraph = () => {
       if (!svg.value || !graphContainer.value) return
 
+      // 调试信息
+      console.log('渲染图谱 - 节点数量:', filteredNodes.value.length)
+      console.log('渲染图谱 - 连线数量:', filteredLinks.value.length)
+      console.log('渲染图谱 - 节点数据:', filteredNodes.value.slice(0, 2))
+      console.log('渲染图谱 - 连线数据:', filteredLinks.value.slice(0, 2))
+
       // 获取容器尺寸
       const containerRect = graphContainer.value.getBoundingClientRect()
       svgWidth.value = containerRect.width - 20
-      svgHeight.value = containerRect.height - 140
+      // 使用更合适的边距，避免过度预留空间
+      svgHeight.value = containerRect.height - 20
 
       // 清空之前的内容
       d3.select(svg.value).selectAll('*').remove()
@@ -176,19 +270,63 @@ export default {
 
       // 创建力导向图
       const simulation = d3.forceSimulation(filteredNodes.value)
-        .force('link', d3.forceLink(filteredLinks.value).id(d => d.id).distance(100))
-        .force('charge', d3.forceManyBody().strength(-300))
+        .force('link', d3.forceLink(filteredLinks.value).id(d => d.id).distance(80))
+        .force('charge', d3.forceManyBody().strength(-250))
         .force('center', d3.forceCenter(svgWidth.value / 2, svgHeight.value / 2))
-        .force('collision', d3.forceCollide().radius(30))
+        .force('collision', d3.forceCollide().radius(25))
+
+      // 自动缩放函数
+      const autoFit = () => {
+        if (filteredNodes.value.length === 0) return
+        
+        // 计算图谱的边界
+        const bounds = g.node().getBBox()
+        const parent = g.node().parentNode
+        const fullWidth = svgWidth.value
+        const fullHeight = svgHeight.value
+        
+        const width = bounds.width
+        const height = bounds.height
+        
+        if (width === 0 || height === 0) return
+        
+        // 计算缩放比例，留一些边距
+        const scale = 0.85 / Math.max(width / fullWidth, height / fullHeight)
+        const translate = [
+          fullWidth / 2 - scale * (bounds.x + width / 2),
+          fullHeight / 2 - scale * (bounds.y + height / 2)
+        ]
+        
+        // 应用变换
+        const transform = d3.zoomIdentity.translate(translate[0], translate[1]).scale(scale)
+        svgElement.transition().duration(1000).call(zoom.transform, transform)
+      }
 
       // 绘制连接线
       const links = g.append('g')
+        .attr('class', 'links')
         .selectAll('line')
         .data(filteredLinks.value)
         .enter().append('line')
-        .attr('stroke', '#999')
-        .attr('stroke-opacity', 0.6)
-        .attr('stroke-width', d => Math.sqrt(d.value))
+        .attr('stroke', '#9aa0a6')
+        .attr('stroke-opacity', 0.7)
+        .attr('stroke-width', d => Math.sqrt(d.value || 1))
+        .style('cursor', 'pointer')
+        .on('mouseover', function(event, d) {
+          d3.select(this).attr('stroke-width', Math.sqrt(d.value || 1) * 1.5).attr('stroke-opacity', 1)
+          
+          // 显示关系标签的悬浮效果
+          const linkLabel = g.selectAll('.link-label')
+          linkLabel.style('opacity', link => link === d ? 1 : 0.3)
+        })
+        .on('mouseout', function(event, d) {
+          d3.select(this).attr('stroke-width', Math.sqrt(d.value || 1)).attr('stroke-opacity', 0.7)
+          
+          // 恢复关系标签的正常显示
+          const linkLabel = g.selectAll('.link-label')
+          linkLabel.style('opacity', 1)
+        })
+        .style('display', filteredLinks.value.length > 0 ? 'block' : 'none')
 
       // 绘制节点
       const nodes = g.append('g')
@@ -216,34 +354,88 @@ export default {
           .on('end', dragended)
         )
 
-      // 添加标签
+      // 添加节点标签
       const labels = g.append('g')
-        .selectAll('text')
+        .selectAll('.node-label')
         .data(filteredNodes.value)
         .enter().append('text')
+        .attr('class', 'node-label')
         .text(d => d.label)
-        .attr('font-size', 12)
+        .attr('font-size', 11)
         .attr('dx', 20)
         .attr('dy', 4)
-        .attr('fill', '#333')
+        .attr('fill', '#2d3748')
+        .attr('font-weight', 'bold')
         .style('pointer-events', 'none')
+        .style('text-shadow', '1px 1px 2px rgba(255,255,255,0.8)')
         .style('display', showLabels.value ? 'block' : 'none')
+        
+      // 添加关系标签
+      const linkLabels = g.append('g')
+        .attr('class', 'link-labels')
+        .selectAll('.link-label')
+        .data(filteredLinks.value)
+        .enter().append('text')
+        .attr('class', 'link-label')
+        .text(d => d.relationshipType || '')
+        .attr('font-size', 10)
+        .attr('fill', '#4a5568')
+        .attr('text-anchor', 'middle')
+        .attr('stroke', 'white')
+        .attr('stroke-width', 0.5)
+        .attr('paint-order', 'stroke')
+        .style('pointer-events', 'none')
+        .style('font-style', 'italic')
+        .style('opacity', 0.8)
 
       // 更新位置
       simulation.on('tick', () => {
         links
-          .attr('x1', d => d.source.x)
-          .attr('y1', d => d.source.y)
-          .attr('x2', d => d.target.x)
-          .attr('y2', d => d.target.y)
+          .attr('x1', d => {
+            const source = typeof d.source === 'object' ? d.source : {x: 0, y: 0}
+            return source.x || 0
+          })
+          .attr('y1', d => {
+            const source = typeof d.source === 'object' ? d.source : {x: 0, y: 0}
+            return source.y || 0
+          })
+          .attr('x2', d => {
+            const target = typeof d.target === 'object' ? d.target : {x: 0, y: 0}
+            return target.x || 0
+          })
+          .attr('y2', d => {
+            const target = typeof d.target === 'object' ? d.target : {x: 0, y: 0}
+            return target.y || 0
+          })
 
         nodes
-          .attr('cx', d => d.x)
-          .attr('cy', d => d.y)
+          .attr('cx', d => d.x || 0)
+          .attr('cy', d => d.y || 0)
 
         labels
-          .attr('x', d => d.x)
-          .attr('y', d => d.y)
+          .attr('x', d => (d.x || 0) + 20)
+          .attr('y', d => (d.y || 0) + 4)
+          
+        // 更新关系标签位置（在连线中点显示）
+        linkLabels
+          .attr('x', d => {
+            const source = typeof d.source === 'object' ? d.source : {x: 0, y: 0}
+            const target = typeof d.target === 'object' ? d.target : {x: 0, y: 0}
+            return ((source.x || 0) + (target.x || 0)) / 2
+          })
+          .attr('y', d => {
+            const source = typeof d.source === 'object' ? d.source : {x: 0, y: 0}
+            const target = typeof d.target === 'object' ? d.target : {x: 0, y: 0}
+            return ((source.y || 0) + (target.y || 0)) / 2
+          })
+      })
+      
+      // 仿真完成后自动缩放适配
+      simulation.on('end', () => {
+        // 延迟一下确保所有元素都已渲染
+        setTimeout(() => {
+          autoFit()
+        }, 100)
       })
 
       // 拖拽函数
@@ -284,12 +476,13 @@ export default {
     // 获取节点类型颜色
     const getNodeTypeColor = (type) => {
       const colorMap = {
-        root: 'danger',
-        system: 'success',
-        disease: 'primary',
-        symptom: 'warning',
-        treatment: 'info',
-        cause: ''
+        disease: 'danger',
+        treatment: 'primary', 
+        examination: 'warning',
+        medication: 'info',
+        vital_signs: 'success',
+        complication: '',
+        other: 'info'
       }
       return colorMap[type] || 'info'
     }
@@ -297,12 +490,13 @@ export default {
     // 获取节点类型文本
     const getNodeTypeText = (type) => {
       const textMap = {
-        root: '根节点',
-        system: '系统',
         disease: '疾病',
-        symptom: '症状',
-        treatment: '处置',
-        cause: '原因'
+        treatment: '治疗',
+        examination: '检查', 
+        medication: '药物',
+        vital_signs: '生命体征',
+        complication: '并发症',
+        other: '其他'
       }
       return textMap[type] || type
     }
@@ -321,6 +515,81 @@ export default {
       return node ? node.label : nodeId
     }
 
+    // 获取节点类型图标
+    const getNodeTypeIcon = (type) => {
+      const iconMap = {
+        disease: '🏥',
+        treatment: '⚕️',
+        examination: '🔬',
+        medication: '💊',
+        vital_signs: '📊',
+        complication: '⚠️',
+        other: '🔵'
+      }
+      return iconMap[type] || '🔵'
+    }
+
+    // 格式化属性键
+    const formatPropertyKey = (key) => {
+      const keyMap = {
+        '严重程度': '严重程度',
+        '紧急程度': '紧急程度',
+        '所属系统': '所属系统',
+        '症状描述': '症状描述',
+        '操作类型': '操作类型',
+        '注意事项': '注意事项',
+        '检查目的': '检查目的',
+        '正常范围': '正常范围',
+        '异常指标': '异常指标',
+        '用药途径': '用药途径',
+        '剂量': '剂量',
+        '使用时机': '使用时机',
+        '正常范围_生命': '正常范围',
+        '异常阈值': '异常阈值',
+        '监测频率': '监测频率',
+        '发生率': '发生率',
+        '危险因素': '危险因素',
+        '预防措施': '预防措施'
+      }
+      return keyMap[key] || key
+    }
+
+    // 获取关系方向
+    const getRelationshipDirection = (currentNodeId, link) => {
+      const sourceId = typeof link.source === 'object' ? link.source.id : link.source
+      const targetId = typeof link.target === 'object' ? link.target.id : link.target
+      
+      if (sourceId === currentNodeId) {
+        return '→'
+      } else if (targetId === currentNodeId) {
+        return '←'
+      }
+      return '↔'
+    }
+
+    // 获取关系类型颜色
+    const getRelationshipTypeColor = (relationshipType) => {
+      const colorMap = {
+        '需要治疗': 'danger',
+        '需要检查': 'warning',
+        '使用药物': 'info',
+        '监测指标': 'success',
+        '引起并发症': 'danger',
+        '治疗': 'primary',
+        '检查': 'warning',
+        '药物': 'info',
+        '指标': 'success',
+        '并发症': 'danger'
+      }
+      return colorMap[relationshipType] || 'info'
+    }
+
+    // 突出显示连接
+    const highlightConnection = (link) => {
+      // 这里可以添加高亮特定连接的逻辑
+      console.log('高亮连接:', link)
+    }
+
     // 监听节点类型筛选变化
     watch(selectedNodeType, () => {
       renderGraph()
@@ -337,6 +606,7 @@ export default {
       graphContainer,
       svg,
       isLoading,
+      isRefreshing,
       showLabels,
       showDetails,
       selectedNode,
@@ -344,12 +614,21 @@ export default {
       svgWidth,
       svgHeight,
       nodeColors,
+      databaseStatus,
+      databaseStatusType,
       filteredNodes,
       filteredLinks,
       resetView,
       toggleLabels,
+      refreshData,
+      checkDatabaseStatus,
       getNodeTypeColor,
       getNodeTypeText,
+      getNodeTypeIcon,
+      formatPropertyKey,
+      getRelationshipDirection,
+      getRelationshipTypeColor,
+      highlightConnection,
       getNodeConnections,
       getNodeName
     }
@@ -391,6 +670,12 @@ export default {
   border-bottom: 1px solid #e4e7ed;
 }
 
+.graph-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+
 .graph-container {
   flex: 1;
   position: relative;
@@ -420,56 +705,248 @@ export default {
   to { transform: rotate(360deg); }
 }
 
+/* Neo4j风格详情面板样式 */
+.neo4j-details-panel {
+  font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+}
+
+.node-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 16px;
+  background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+  border-radius: 8px;
+  margin-bottom: 20px;
+  border: 1px solid #dee2e6;
+}
+
+.node-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  color: white;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+}
+
+.node-basic-info h3 {
+  margin: 0 0 8px 0;
+  color: #2d3748;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.node-properties {
+  margin-bottom: 24px;
+}
+
+.node-properties h5 {
+  margin: 0 0 12px 0;
+  color: #4a5568;
+  font-size: 14px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.properties-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
+}
+
+.property-card {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 12px;
+  transition: all 0.2s ease;
+}
+
+.property-card:hover {
+  border-color: #cbd5e0;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+}
+
+.property-key {
+  font-size: 12px;
+  color: #718096;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+}
+
+.property-value {
+  font-size: 14px;
+  color: #2d3748;
+  font-weight: 500;
+}
+
 .node-connections {
-  margin-top: 20px;
+  margin-top: 24px;
 }
 
 .node-connections h5 {
-  margin: 16px 0 8px 0;
-  color: #606266;
+  margin: 0 0 16px 0;
+  color: #4a5568;
+  font-size: 14px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
-.node-connections ul {
-  padding-left: 20px;
+.connections-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
-.node-connections li {
-  margin-bottom: 4px;
-  color: #909399;
+.connection-item {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 12px;
+  cursor: pointer;
+  transition: all 0.2s ease;
 }
 
+.connection-item:hover {
+  border-color: #3182ce;
+  box-shadow: 0 2px 8px rgba(49, 130, 206, 0.1);
+  transform: translateY(-1px);
+}
+
+.connection-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.connected-node {
+  font-size: 14px;
+  color: #2d3748;
+  font-weight: 500;
+}
+
+.relationship-arrow {
+  font-size: 16px;
+  color: #718096;
+  font-weight: bold;
+  margin: 0 8px;
+}
+
+.relationship-tag {
+  margin-bottom: 8px;
+}
+
+.relation-properties {
+  margin-top: 8px;
+}
+
+.property-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.relation-property-tag {
+  font-size: 11px !important;
+  height: 20px !important;
+  line-height: 18px !important;
+}
+
+/* 图例样式 */
 .legend {
   position: absolute;
   top: 20px;
   right: 20px;
-  background: rgba(255, 255, 255, 0.9);
-  padding: 12px;
-  border-radius: 6px;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+  background: rgba(255, 255, 255, 0.95);
+  padding: 16px;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255,255,255,0.2);
 }
 
 .legend h5 {
-  margin: 0 0 8px 0;
-  color: #606266;
-  font-size: 12px;
+  margin: 0 0 12px 0;
+  color: #4a5568;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
 }
 
 .legend-items {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 
 .legend-item {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   font-size: 12px;
+  color: #4a5568;
 }
 
 .legend-color {
-  width: 12px;
-  height: 12px;
+  width: 14px;
+  height: 14px;
   border-radius: 50%;
+  border: 2px solid white;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+}
+
+/* SVG图形样式 - Neo4j风格 */
+:deep(.node) {
+  filter: drop-shadow(0 2px 4px rgba(0,0,0,0.1));
+  transition: all 0.2s ease;
+}
+
+:deep(.node:hover) {
+  filter: drop-shadow(0 4px 8px rgba(0,0,0,0.2));
+}
+
+:deep(.link) {
+  transition: all 0.2s ease;
+}
+
+:deep(.node-label) {
+  user-select: none;
+  font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+}
+
+:deep(.link-label) {
+  user-select: none;
+  font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  text-shadow: 1px 1px 2px rgba(255,255,255,0.9);
+}
+
+/* 响应式设计 */
+@media (max-width: 768px) {
+  .node-header {
+    flex-direction: column;
+    text-align: center;
+  }
+  
+  .properties-grid {
+    grid-template-columns: 1fr;
+  }
+  
+  .connection-main {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
 }
 </style>

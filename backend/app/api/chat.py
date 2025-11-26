@@ -1,4 +1,5 @@
 from flask import Blueprint,request,jsonify
+from datetime import datetime
 
 chat_bp=Blueprint('chat',__name__)
 
@@ -6,15 +7,16 @@ chat_bp=Blueprint('chat',__name__)
 def chat():
     try:
         data=request.get_json()
-        user_message=data.get('user_message','').strip()
+        user_message=data.get('message','').strip()
 
         if not user_message:
             return jsonify({"error":"消息不能为空"}),400
 
-        response="的额"
+        response="问答接口尚需开发，请等待"
 
         return jsonify({
-            "response":response
+            "response":response,
+            "timestamp":datetime.utcnow().isoformat()
         })
 
     except Exception as e:
